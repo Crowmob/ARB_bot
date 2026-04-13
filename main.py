@@ -1,4 +1,5 @@
 import asyncio
+import time
 import json
 import requests
 import websockets
@@ -196,8 +197,8 @@ def start_bot():
     def run_scanner():
         while True:
             scan()
-            stats["last_scan"] = str(asyncio.get_event_loop().time())
-            asyncio.sleep(SCAN_INTERVAL)
+            stats["last_scan"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            time.sleep(SCAN_INTERVAL)
 
     threading.Thread(target=run_ws, daemon=True).start()
     threading.Thread(target=run_scanner, daemon=True).start()
