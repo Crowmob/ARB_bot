@@ -1,13 +1,13 @@
 import asyncio
-import time
 import json
 import requests
 import websockets
 import random
 import threading
-import os
+import time
 from collections import defaultdict
 from fastapi import FastAPI
+from threading import Lock
 
 # =========================
 # CONFIG
@@ -20,21 +20,18 @@ START_CAPITAL = 1000
 SCAN_INTERVAL = 0.5
 MIN_PROFIT = 0.3
 
+# =========================
+# STATE
+# =========================
 prices = {}
+prices_lock = Lock()
+
 adj = defaultdict(set)
 cycles = []
-edge_to_cycles = defaultdict(list)
-dirty_edges = set()
+stats = {"opportunities": 0, "last_scan": None}
 
 app = FastAPI()
 
-# =========================
-# SIMPLE STATS STORE
-# =========================
-stats = {
-    "opportunities": 0,
-    "last_scan": None
-}
 
 # =========================
 # SYMBOLS
@@ -44,6 +41,7 @@ def get_symbols():
     data = requests.get(url, params={"category": "spot"}).json()
     return data["result"]["list"]
 
+
 # =========================
 # GRAPH
 # =========================
@@ -51,32 +49,34 @@ def build_graph(symbols):
     for s in symbols:
         base = s["baseCoin"]
         quote = s["quoteCoin"]
-
         adj[base].add(quote)
         adj[quote].add(base)
 
+
 # =========================
-# PRICE UPDATE
+# PRICE UPDATE (THREAD SAFE)
 # =========================
 def update_price(symbol, base, quote, bid, ask):
-    prices[symbol] = {
-        "base": base,
-        "quote": quote,
-        "bid": bid,
-        "ask": ask
-    }
-    dirty_edges.add(frozenset((base, quote)))
+    with prices_lock:
+        prices[symbol] = {
+            "base": base,
+            "quote": quote,
+            "bid": bid,
+            "ask": ask
+        }
+
 
 # =========================
 # RATE
 # =========================
-def get_rate(x, y):
-    for sym, data in prices.items():
+def get_rate(x, y, snapshot):
+    for sym, data in snapshot.items():
         if data["base"] == x and data["quote"] == y:
             return data["bid"]
         if data["base"] == y and data["quote"] == x:
             return 1 / data["ask"]
     return None
+
 
 # =========================
 # SIMULATION
@@ -84,14 +84,16 @@ def get_rate(x, y):
 def slippage():
     return BASE_SLIPPAGE * random.uniform(0.5, 1.5)
 
+
 def shock(v):
     return v * (1 + random.uniform(-VOLATILITY, VOLATILITY))
 
-def simulate_once(a, b, c):
+
+def simulate_once(a, b, c, snapshot):
     cap = START_CAPITAL
 
     for x, y in [(a, b), (b, c), (c, a)]:
-        rate = get_rate(x, y)
+        rate = get_rate(x, y, snapshot)
         if not rate:
             return None
 
@@ -103,121 +105,140 @@ def simulate_once(a, b, c):
 
     return cap
 
-def simulate_mc(a, b, c):
-    res = []
+
+def simulate_mc(a, b, c, snapshot):
+    results = []
 
     for _ in range(MONTE_CARLO_RUNS):
-        r = simulate_once(a, b, c)
+        r = simulate_once(a, b, c, snapshot)
         if r:
-            res.append(r)
+            results.append(r)
 
-    if not res:
+    if not results:
         return None
 
-    return sum(res) / len(res)
+    return sum(results) / len(results)
+
 
 # =========================
-# SCANNER
+# SCANNER (SAFE SNAPSHOT)
 # =========================
 def scan():
+    with prices_lock:
+        snapshot = dict(prices)
+
     found = 0
 
-    for edge in list(dirty_edges):
-        for sym, data in prices.items():
-            pass
+    nodes = list(adj.keys())
 
-    for sym in list(prices.keys()):
-        a = prices[sym]["base"]
-        b = prices[sym]["quote"]
+    for a in nodes:
+        for b in adj[a]:
+            for c in adj[b]:
+                if c == a:
+                    continue
 
-        for c in adj[b]:
-            if c == a:
-                continue
+                result = simulate_mc(a, b, c, snapshot)
+                if not result:
+                    continue
 
-            result = simulate_mc(a, b, c)
-            if not result:
-                continue
+                profit = ((result / START_CAPITAL) - 1) * 100
 
-            profit = ((result / START_CAPITAL) - 1) * 100
-
-            if profit > MIN_PROFIT:
-                print(f"🔥 ARB {a}->{b}->{c}->{a} | {profit:.3f}%")
-                found += 1
+                if profit > MIN_PROFIT:
+                    print(f"🔥 ARB {a}->{b}->{c}->{a} | {profit:.3f}%")
+                    found += 1
 
     stats["opportunities"] = found
+    stats["last_scan"] = time.strftime("%H:%M:%S")
+
 
 # =========================
-# WEBSOCKET
+# WEBSOCKET LOOP
 # =========================
 async def ws(symbols):
     url = "wss://stream.bybit.com/v5/public/spot"
 
     args = [f"orderbook.1.{s['symbol']}" for s in symbols]
 
-    async with websockets.connect(url) as ws:
-        print("WebSocket connected")
+    symbol_map = {s["symbol"]: s for s in symbols}
 
-        for i in range(0, len(args), 10):
-            await ws.send(json.dumps({
-                "op": "subscribe",
-                "args": args[i:i+10]
-            }))
+    while True:
+        try:
+            async with websockets.connect(url) as ws:
+                print("WebSocket connected")
 
-        while True:
-            msg = await ws.recv()
-            data = json.loads(msg)
+                for i in range(0, len(args), 10):
+                    await ws.send(json.dumps({
+                        "op": "subscribe",
+                        "args": args[i:i+10]
+                    }))
 
-            if "topic" not in data:
-                continue
+                while True:
+                    msg = await ws.recv()
+                    data = json.loads(msg)
 
-            symbol = data["topic"].split(".")[-1]
-            ob = data["data"]
+                    if "topic" not in data:
+                        continue
 
-            try:
-                update_price(
-                    symbol,
-                    symbol.split("USDT")[0] if "USDT" in symbol else symbol[:3],
-                    "USDT",
-                    float(ob["b"][0][0]),
-                    float(ob["a"][0][0])
-                )
-            except:
-                continue
+                    symbol = data["topic"].split(".")[-1]
+                    if symbol not in symbol_map:
+                        continue
+
+                    ob = data["data"]
+
+                    try:
+                        update_price(
+                            symbol,
+                            symbol_map[symbol]["baseCoin"],
+                            symbol_map[symbol]["quoteCoin"],
+                            float(ob["b"][0][0]),
+                            float(ob["a"][0][0])
+                        )
+                    except:
+                        continue
+
+        except Exception as e:
+            print("WS reconnect:", e)
+            await asyncio.sleep(5)
+
 
 # =========================
-# LOOP
+# THREAD WORKERS
 # =========================
+def run_ws(symbols):
+    asyncio.run(ws(symbols))
+
+
+def run_scanner():
+    while True:
+        scan()
+        time.sleep(SCAN_INTERVAL)
+
+
 def start_bot():
     symbols = get_symbols()
     build_graph(symbols)
 
-    def run_ws():
-        asyncio.run(ws(symbols))
-
-    def run_scanner():
-        while True:
-            scan()
-            stats["last_scan"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            time.sleep(SCAN_INTERVAL)
-
-    threading.Thread(target=run_ws, daemon=True).start()
+    threading.Thread(target=run_ws, args=(symbols,), daemon=True).start()
     threading.Thread(target=run_scanner, daemon=True).start()
 
+
 # =========================
-# FASTAPI ROUTES (RENDER NEEDS THIS)
+# FASTAPI
 # =========================
 @app.get("/")
 def home():
     return {"status": "running"}
 
+
 @app.get("/stats")
 def get_stats():
     return stats
 
+
 # =========================
-# START BOT ON SERVER BOOT
+# STARTUP
 # =========================
 @app.on_event("startup")
 def startup():
     print("Starting bot...")
-    threading.Thread(target=start_bot, daemon=True).start()
+    start_bot()
