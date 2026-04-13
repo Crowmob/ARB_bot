@@ -3,7 +3,10 @@ import json
 import requests
 import websockets
 import random
+import threading
+import os
 from collections import defaultdict
+from fastapi import FastAPI
 
 # =========================
 # CONFIG
@@ -13,70 +16,43 @@ BASE_SLIPPAGE = 0.001
 VOLATILITY = 0.0015
 MONTE_CARLO_RUNS = 3
 START_CAPITAL = 1000
-SCAN_INTERVAL = 0.2
+SCAN_INTERVAL = 0.5
 MIN_PROFIT = 0.3
 
-# symbol -> {bid, ask, base, quote}
 prices = {}
-
-# graph: asset -> neighbors
 adj = defaultdict(set)
-
 cycles = []
 edge_to_cycles = defaultdict(list)
 dirty_edges = set()
 
+app = FastAPI()
 
 # =========================
-# SYMBOLS (REAL STRUCTURE)
+# SIMPLE STATS STORE
+# =========================
+stats = {
+    "opportunities": 0,
+    "last_scan": None
+}
+
+# =========================
+# SYMBOLS
 # =========================
 def get_symbols():
     url = "https://api.bybit.com/v5/market/instruments-info"
-    r = requests.get(url, params={"category": "spot"}).json()
-
-    symbols = []
-
-    for item in r["result"]["list"]:
-        symbols.append({
-            "symbol": item["symbol"],
-            "base": item["baseCoin"],
-            "quote": item["quoteCoin"]
-        })
-
-    return symbols
-
+    data = requests.get(url, params={"category": "spot"}).json()
+    return data["result"]["list"]
 
 # =========================
-# GRAPH BUILD (CORRECT)
+# GRAPH
 # =========================
 def build_graph(symbols):
     for s in symbols:
-        base = s["base"]
-        quote = s["quote"]
+        base = s["baseCoin"]
+        quote = s["quoteCoin"]
 
         adj[base].add(quote)
         adj[quote].add(base)
-
-
-# =========================
-# CYCLE BUILD
-# =========================
-def build_cycles():
-    global cycles
-    nodes = list(adj.keys())
-
-    for a in nodes:
-        for b in adj[a]:
-            for c in adj[b]:
-                if c != a and a in adj[c]:
-                    cycles.append((a, b, c))
-
-    # index cycles by edges
-    for i, (a, b, c) in enumerate(cycles):
-        edge_to_cycles[frozenset((a, b))].append(i)
-        edge_to_cycles[frozenset((b, c))].append(i)
-        edge_to_cycles[frozenset((c, a))].append(i)
-
 
 # =========================
 # PRICE UPDATE
@@ -88,12 +64,10 @@ def update_price(symbol, base, quote, bid, ask):
         "bid": bid,
         "ask": ask
     }
-
     dirty_edges.add(frozenset((base, quote)))
 
-
 # =========================
-# RATE CALCULATION (CORRECT DIRECTION)
+# RATE
 # =========================
 def get_rate(x, y):
     for sym, data in prices.items():
@@ -103,17 +77,14 @@ def get_rate(x, y):
             return 1 / data["ask"]
     return None
 
-
 # =========================
 # SIMULATION
 # =========================
 def slippage():
     return BASE_SLIPPAGE * random.uniform(0.5, 1.5)
 
-
 def shock(v):
     return v * (1 + random.uniform(-VOLATILITY, VOLATILITY))
-
 
 def simulate_once(a, b, c):
     cap = START_CAPITAL
@@ -131,37 +102,36 @@ def simulate_once(a, b, c):
 
     return cap
 
-
 def simulate_mc(a, b, c):
-    results = []
+    res = []
 
     for _ in range(MONTE_CARLO_RUNS):
         r = simulate_once(a, b, c)
         if r:
-            results.append(r)
+            res.append(r)
 
-    if not results:
+    if not res:
         return None
 
-    return sum(results) / len(results)
-
+    return sum(res) / len(res)
 
 # =========================
-# SCAN ENGINE
+# SCANNER
 # =========================
 def scan():
-    checked = set()
     found = 0
 
     for edge in list(dirty_edges):
-        idxs = edge_to_cycles.get(edge, [])
+        for sym, data in prices.items():
+            pass
 
-        for idx in idxs:
-            if idx in checked:
+    for sym in list(prices.keys()):
+        a = prices[sym]["base"]
+        b = prices[sym]["quote"]
+
+        for c in adj[b]:
+            if c == a:
                 continue
-
-            checked.add(idx)
-            a, b, c = cycles[idx]
 
             result = simulate_mc(a, b, c)
             if not result:
@@ -173,34 +143,23 @@ def scan():
                 print(f"🔥 ARB {a}->{b}->{c}->{a} | {profit:.3f}%")
                 found += 1
 
-    dirty_edges.clear()
-
-    if found:
-        print(f"--- {found} opportunities ---")
-
+    stats["opportunities"] = found
 
 # =========================
 # WEBSOCKET
 # =========================
-def chunk(lst, n=10):
-    for i in range(0, len(lst), n):
-        yield lst[i:i+n]
-
-
 async def ws(symbols):
     url = "wss://stream.bybit.com/v5/public/spot"
 
     args = [f"orderbook.1.{s['symbol']}" for s in symbols]
 
-    symbol_map = {s["symbol"]: s for s in symbols}
-
     async with websockets.connect(url) as ws:
         print("WebSocket connected")
 
-        for batch in chunk(args, 10):
+        for i in range(0, len(args), 10):
             await ws.send(json.dumps({
                 "op": "subscribe",
-                "args": batch
+                "args": args[i:i+10]
             }))
 
         while True:
@@ -211,51 +170,53 @@ async def ws(symbols):
                 continue
 
             symbol = data["topic"].split(".")[-1]
-            if symbol not in symbol_map:
-                continue
-
             ob = data["data"]
 
             try:
                 update_price(
                     symbol,
-                    symbol_map[symbol]["base"],
-                    symbol_map[symbol]["quote"],
+                    symbol.split("USDT")[0] if "USDT" in symbol else symbol[:3],
+                    "USDT",
                     float(ob["b"][0][0]),
                     float(ob["a"][0][0])
                 )
             except:
                 continue
 
-
 # =========================
-# SCANNER LOOP
+# LOOP
 # =========================
-async def scanner():
-    while True:
-        scan()
-        await asyncio.sleep(SCAN_INTERVAL)
-
-
-# =========================
-# MAIN
-# =========================
-async def main():
-    print("Loading symbols...")
+def start_bot():
     symbols = get_symbols()
-
-    print("Building graph...")
     build_graph(symbols)
 
-    print("Building cycles...")
-    build_cycles()
+    def run_ws():
+        asyncio.run(ws(symbols))
 
-    print("Cycles found:", len(cycles))
+    def run_scanner():
+        while True:
+            scan()
+            stats["last_scan"] = str(asyncio.get_event_loop().time())
+            asyncio.sleep(SCAN_INTERVAL)
 
-    await asyncio.gather(
-        ws(symbols),
-        scanner()
-    )
+    threading.Thread(target=run_ws, daemon=True).start()
+    threading.Thread(target=run_scanner, daemon=True).start()
 
+# =========================
+# FASTAPI ROUTES (RENDER NEEDS THIS)
+# =========================
+@app.get("/")
+def home():
+    return {"status": "running"}
 
-asyncio.run(main())
+@app.get("/stats")
+def get_stats():
+    return stats
+
+# =========================
+# START BOT ON SERVER BOOT
+# =========================
+@app.on_event("startup")
+def startup():
+    print("Starting bot...")
+    threading.Thread(target=start_bot, daemon=True).start()
