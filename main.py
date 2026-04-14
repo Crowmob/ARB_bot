@@ -14,7 +14,7 @@ VOLATILITY = 0.0015
 MONTE_CARLO_RUNS = 3
 START_CAPITAL = 1000
 SCAN_INTERVAL = 0.2
-MIN_PROFIT = 0.3
+MIN_PROFIT = 0.3  # lower realistic threshold
 
 # symbol -> {bid, ask, base, quote}
 prices = {}
