@@ -1,261 +1,269 @@
 import asyncio
 import json
-import requests
+import aiohttp
 import websockets
-import random
 from collections import defaultdict
 
 # =========================
 # CONFIG
 # =========================
-FEE = 0.001
-BASE_SLIPPAGE = 0.001
-VOLATILITY = 0.0015
-MONTE_CARLO_RUNS = 3
-START_CAPITAL = 1000
-SCAN_INTERVAL = 0.2
-MIN_PROFIT = 0.3  # lower realistic threshold
 
-# symbol -> {bid, ask, base, quote}
-prices = {}
+BINANCE_WS = "wss://stream.binance.com:9443/stream"
+BYBIT_WS = "wss://stream.bybit.com/v5/public/spot"
 
-# graph: asset -> neighbors
-adj = defaultdict(set)
+FEE = {
+    "binance": 0.001,
+    "bybit": 0.001
+}
 
-cycles = []
-edge_to_cycles = defaultdict(list)
-dirty_edges = set()
-
+MIN_PROFIT = 1.001  # 0.1%
 
 # =========================
-# SYMBOLS (REAL STRUCTURE)
+# STATE
 # =========================
-def get_symbols():
-    url = "https://api.bybit.com/v5/market/instruments-info"
-    r = requests.get(url, params={"category": "spot"}).json()
 
-    symbols = []
+orderbooks = {
+    "binance": {},
+    "bybit": {}
+}
 
-    for item in r["result"]["list"]:
-        symbols.append({
-            "symbol": item["symbol"],
-            "base": item["baseCoin"],
-            "quote": item["quoteCoin"]
-        })
+graph = {
+    "binance": defaultdict(dict),
+    "bybit": defaultdict(dict)
+}
 
-    return symbols
-
+queue = asyncio.Queue()
 
 # =========================
-# GRAPH BUILD (CORRECT)
+# REGISTER GRAPH (DIRECTED)
 # =========================
-def build_graph(symbols):
-    for s in symbols:
-        base = s["base"]
-        quote = s["quote"]
 
-        adj[base].add(quote)
-        adj[quote].add(base)
-
+def register(exchange, base, quote, symbol):
+    # base -> quote
+    graph[exchange][base][quote] = symbol
+    # quote -> base
+    graph[exchange][quote][base] = symbol
 
 # =========================
-# CYCLE BUILD
+# UPDATE ORDERBOOK
 # =========================
-def build_cycles():
-    global cycles
-    nodes = list(adj.keys())
 
-    for a in nodes:
-        for b in adj[a]:
-            for c in adj[b]:
-                if c != a and a in adj[c]:
-                    cycles.append((a, b, c))
-
-    # index cycles by edges
-    for i, (a, b, c) in enumerate(cycles):
-        edge_to_cycles[frozenset((a, b))].append(i)
-        edge_to_cycles[frozenset((b, c))].append(i)
-        edge_to_cycles[frozenset((c, a))].append(i)
-
-
-# =========================
-# PRICE UPDATE
-# =========================
-def update_price(symbol, base, quote, bid, ask):
-    prices[symbol] = {
-        "base": base,
-        "quote": quote,
-        "bid": bid,
-        "ask": ask
+def update(exchange, symbol, bid, ask):
+    orderbooks[exchange][symbol] = {
+        "bid": float(bid),
+        "ask": float(ask)
     }
 
-    dirty_edges.add(frozenset((base, quote)))
+# =========================
+# TRIANGLE FINDER
+# =========================
 
+def find_triangles():
+    tris = []
+
+    for ex in ["binance", "bybit"]:
+        g = graph[ex]
+
+        # ONLY start from USDT
+        if "USDT" not in g:
+            continue
+
+        for a in g["USDT"]:          # USDT → A
+            for b in g[a]:            # A → B
+                if "USDT" in g[b]:   # B → USDT
+                    tris.append(("USDT", a, b, "USDT"))
+
+    return tris
 
 # =========================
-# RATE CALCULATION (CORRECT DIRECTION)
+# REAL CONVERSION ENGINE
 # =========================
-def get_rate(x, y):
-    for sym, data in prices.items():
-        if data["base"] == x and data["quote"] == y:
-            return data["bid"]
-        if data["base"] == y and data["quote"] == x:
-            return 1 / data["ask"]
-    return None
 
-
-# =========================
-# SIMULATION
-# =========================
-def slippage():
-    return BASE_SLIPPAGE * random.uniform(0.5, 1.5)
-
-
-def shock(v):
-    return v * (1 + random.uniform(-VOLATILITY, VOLATILITY))
-
-
-def simulate_once(a, b, c):
-    cap = START_CAPITAL
-
-    for x, y in [(a, b), (b, c), (c, a)]:
-        rate = get_rate(x, y)
-        if not rate:
-            return None
-
-        rate = shock(rate)
-
-        cap *= rate
-        cap *= (1 - FEE)
-        cap *= (1 - slippage())
-
-    return cap
-
-
-def simulate_mc(a, b, c):
-    results = []
-
-    for _ in range(MONTE_CARLO_RUNS):
-        r = simulate_once(a, b, c)
-        if r:
-            results.append(r)
-
-    if not results:
+def convert(exchange, from_asset, to_asset, amount):
+    symbol = graph[exchange][from_asset].get(to_asset)
+    if not symbol:
         return None
 
-    return sum(results) / len(results)
+    book = orderbooks[exchange].get(symbol)
+    if not book:
+        return None
 
+    fee = FEE[exchange]
 
-# =========================
-# SCAN ENGINE
-# =========================
-def scan():
-    checked = set()
-    found = 0
+    # CASE 1: SELL from_asset → to_asset (use BID)
+    # example: BTCUSDT and you go BTC → USDT
+    if from_asset == symbol[:len(from_asset)]:
+        price = book["bid"]
+        return amount * price * (1 - fee)
 
-    for edge in list(dirty_edges):
-        idxs = edge_to_cycles.get(edge, [])
-
-        for idx in idxs:
-            if idx in checked:
-                continue
-
-            checked.add(idx)
-            a, b, c = cycles[idx]
-
-            result = simulate_mc(a, b, c)
-            if not result:
-                continue
-
-            profit = ((result / START_CAPITAL) - 1) * 100
-
-            if profit > MIN_PROFIT:
-                print(f"🔥 ARB {a}->{b}->{c}->{a} | {profit:.3f}%")
-                found += 1
-
-    dirty_edges.clear()
-
-    if found:
-        print(f"--- {found} opportunities ---")
-
+    # CASE 2: BUY from_asset using to_asset (use ASK)
+    # example: USDT → BTC
+    price = book["ask"]
+    return (amount / price) * (1 - fee)
 
 # =========================
-# WEBSOCKET
+# SIMULATE TRIANGLE
 # =========================
-def chunk(lst, n=10):
-    for i in range(0, len(lst), n):
-        yield lst[i:i+n]
 
+def simulate(exchange, tri):
+    usdt, a, b, _ = tri
 
-async def ws(symbols):
-    url = "wss://stream.bybit.com/v5/public/spot"
+    v = 1.0  # start USDT
 
-    args = [f"orderbook.1.{s['symbol']}" for s in symbols]
+    # USDT → A
+    v = convert(exchange, usdt, a, v)
+    if v is None:
+        return None
 
-    symbol_map = {s["symbol"]: s for s in symbols}
+    # A → B
+    v = convert(exchange, a, b, v)
+    if v is None:
+        return None
 
-    async with websockets.connect(url) as ws:
-        print("WebSocket connected")
+    # B → USDT
+    v = convert(exchange, b, usdt, v)
+    if v is None:
+        return None
 
-        for batch in chunk(args, 10):
+    return v
+
+# =========================
+# BINANCE SYMBOLS
+# =========================
+
+async def fetch_binance():
+    url = "https://api.binance.com/api/v3/exchangeInfo"
+
+    async with aiohttp.ClientSession() as s:
+        async with s.get(url) as r:
+            data = await r.json()
+
+    out = []
+    for x in data["symbols"]:
+        if x["status"] != "TRADING":
+            continue
+        out.append((x["baseAsset"], x["quoteAsset"], x["symbol"]))
+    return out
+
+# =========================
+# BYBIT SYMBOLS
+# =========================
+
+async def fetch_bybit():
+    url = "https://api.bybit.com/v5/market/instruments-info?category=spot"
+
+    async with aiohttp.ClientSession() as s:
+        async with s.get(url) as r:
+            data = await r.json()
+
+    out = []
+    for x in data["result"]["list"]:
+        if x["status"] != "Trading":
+            continue
+        out.append((x["baseCoin"], x["quoteCoin"], x["symbol"]))
+    return out
+
+# =========================
+# BINANCE WS (SAFE CHUNKED)
+# =========================
+
+async def binance_ws(symbols):
+    chunk_size = 180
+
+    async def run(chunk):
+        streams = "/".join([s[2].lower() + "@bookTicker" for s in chunk])
+        url = f"{BINANCE_WS}?streams={streams}"
+
+        async with websockets.connect(url) as ws:
+            async for msg in ws:
+                data = json.loads(msg).get("data")
+                if not data:
+                    continue
+
+                update("binance", data["s"], data["b"], data["a"])
+                await queue.put(True)
+
+    await asyncio.gather(*[
+        run(symbols[i:i+chunk_size])
+        for i in range(0, len(symbols), chunk_size)
+    ])
+
+# =========================
+# BYBIT WS (10 PER SUB)
+# =========================
+
+async def bybit_ws(symbols):
+    async with websockets.connect(BYBIT_WS) as ws:
+        print("[BYBIT] connected")
+
+        for i in range(0, len(symbols), 10):
+            chunk = symbols[i:i+10]
+            args = [f"orderbook.1.{s[2]}" for s in chunk]
+
             await ws.send(json.dumps({
                 "op": "subscribe",
-                "args": batch
+                "args": args
             }))
 
-        while True:
-            msg = await ws.recv()
+        async for msg in ws:
             data = json.loads(msg)
 
             if "topic" not in data:
                 continue
 
+            d = data.get("data")
+            if not d:
+                continue
+
             symbol = data["topic"].split(".")[-1]
-            if symbol not in symbol_map:
-                continue
-
-            ob = data["data"]
-
-            try:
-                update_price(
-                    symbol,
-                    symbol_map[symbol]["base"],
-                    symbol_map[symbol]["quote"],
-                    float(ob["b"][0][0]),
-                    float(ob["a"][0][0])
-                )
-            except:
-                continue
-
+            update("bybit", symbol, d["b"][0][0], d["a"][0][0])
+            await queue.put(True)
 
 # =========================
-# SCANNER LOOP
+# SCANNER
 # =========================
+
 async def scanner():
-    while True:
-        scan()
-        await asyncio.sleep(SCAN_INTERVAL)
+    await asyncio.sleep(5)
 
+    while True:
+        await queue.get()
+
+        tris = find_triangles()
+
+        for ex in ["binance", "bybit"]:
+            for tri in tris:
+                result = simulate(ex, tri)
+
+                if not result:
+                    continue
+
+                profit = (result - 1) * 100
+                if result > MIN_PROFIT:
+                    print(f"🔥 {ex.upper()} {tri} => {result:.6f} | {profit:.3f}%")
 
 # =========================
 # MAIN
 # =========================
+
 async def main():
-    print("Loading symbols...")
-    symbols = get_symbols()
+    binance = await fetch_binance()
+    bybit = await fetch_bybit()
 
-    print("Building graph...")
-    build_graph(symbols)
+    for b, q, s in binance:
+        register("binance", b, q, s)
 
-    print("Building cycles...")
-    build_cycles()
+    for b, q, s in bybit:
+        register("bybit", b, q, s)
 
-    print("Cycles found:", len(cycles))
+    print("Binance:", len(binance))
+    print("Bybit:", len(bybit))
 
     await asyncio.gather(
-        ws(symbols),
+        binance_ws(binance),
+        bybit_ws(bybit),
         scanner()
     )
 
-
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
