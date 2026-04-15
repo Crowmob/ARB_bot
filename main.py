@@ -88,18 +88,15 @@ def convert(exchange, from_asset, to_asset, amount):
     if not book:
         return None
 
-    fee = FEE[exchange]
-
-    # CASE 1: SELL from_asset → to_asset (use BID)
-    # example: BTCUSDT and you go BTC → USDT
+    # BUY
     if from_asset == symbol[:len(from_asset)]:
-        price = book["bid"]
-        return amount * price * (1 - fee)
+        price = book["ask"]
+        return (amount / price) * (1 - FEE[exchange])
 
-    # CASE 2: BUY from_asset using to_asset (use ASK)
-    # example: USDT → BTC
-    price = book["ask"]
-    return (amount / price) * (1 - fee)
+    # SELL
+    else:
+        price = book["bid"]
+        return amount * price * (1 - FEE[exchange])
 
 # =========================
 # SIMULATE TRIANGLE
@@ -216,7 +213,22 @@ async def bybit_ws(symbols):
                 continue
 
             symbol = data["topic"].split(".")[-1]
-            update("bybit", symbol, d["b"][0][0], d["a"][0][0])
+            bids = d.get("b")
+            asks = d.get("a")
+
+            if not bids or not asks:
+                continue
+
+            if len(bids) == 0 or len(asks) == 0:
+                continue
+
+            bid = bids[0][0] if len(bids[0]) > 0 else None
+            ask = asks[0][0] if len(asks[0]) > 0 else None
+
+            if not bid or not ask:
+                continue
+
+            update("bybit", symbol, bid, ask)
             await queue.put(True)
 
 # =========================
@@ -227,7 +239,7 @@ async def scanner():
     await asyncio.sleep(5)
 
     while True:
-        await queue.get()
+        await asyncio.sleep(0.2)
 
         tris = find_triangles()
 
@@ -239,6 +251,7 @@ async def scanner():
                     continue
 
                 profit = (result - 1) * 100
+
                 if result > MIN_PROFIT:
                     print(f"🔥 {ex.upper()} {tri} => {result:.6f} | {profit:.3f}%")
 
