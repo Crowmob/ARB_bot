@@ -1,5 +1,7 @@
 import asyncio
 import json
+from datetime import datetime
+
 import aiohttp
 import websockets
 from collections import defaultdict
@@ -7,6 +9,8 @@ from collections import defaultdict
 # =========================
 # CONFIG
 # =========================
+
+log_file = open("logs.txt", "a", encoding="utf-8")
 
 BINANCE_WS = "wss://stream.binance.com:9443/stream"
 BYBIT_WS = "wss://stream.bybit.com/v5/public/spot"
@@ -270,6 +274,10 @@ async def scanner():
                 profit = (result - 1) * 100
 
                 if result > MIN_PROFIT:
+                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                    log_file.write(f"{now} 🔥 {ex.upper()} {tri} => {result:.6f} | {profit:.3f}%\n")
+                    log_file.flush()
                     print(f"🔥 {ex.upper()} {tri} => {result:.6f} | {profit:.3f}%")
 
 # =========================
