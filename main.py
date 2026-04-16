@@ -165,20 +165,31 @@ async def fetch_bybit():
 # =========================
 
 async def binance_ws(symbols):
-    chunk_size = 180
+    chunk_size = 50
 
     async def run(chunk):
-        streams = "/".join([s[2].lower() + "@bookTicker" for s in chunk])
-        url = f"{BINANCE_WS}?streams={streams}"
+        while True:
+            try:
+                streams = "/".join([s[2].lower() + "@bookTicker" for s in chunk])
+                url = f"{BINANCE_WS}?streams={streams}"
 
-        async with websockets.connect(url) as ws:
-            async for msg in ws:
-                data = json.loads(msg).get("data")
-                if not data:
-                    continue
+                async with websockets.connect(
+                    url,
+                    ping_interval=20,
+                    ping_timeout=20
+                ) as ws:
+                    print(f"[BINANCE] connected {len(chunk)}")
 
-                update("binance", data["s"], data["b"], data["a"])
-                await queue.put(True)
+                    async for msg in ws:
+                        data = json.loads(msg).get("data")
+                        if not data:
+                            continue
+
+                        update("binance", data["s"], data["b"], data["a"])
+
+            except Exception as e:
+                print(f"[BINANCE] reconnecting... {e}")
+                await asyncio.sleep(2)
 
     await asyncio.gather(*[
         run(symbols[i:i+chunk_size])
@@ -190,46 +201,52 @@ async def binance_ws(symbols):
 # =========================
 
 async def bybit_ws(symbols):
-    async with websockets.connect(BYBIT_WS) as ws:
-        print("[BYBIT] connected")
+    while True:
+        try:
+            async with websockets.connect(
+                BYBIT_WS,
+                ping_interval=20,
+                ping_timeout=20
+            ) as ws:
+                print("[BYBIT] connected")
 
-        for i in range(0, len(symbols), 10):
-            chunk = symbols[i:i+10]
-            args = [f"orderbook.1.{s[2]}" for s in chunk]
+                for i in range(0, len(symbols), 10):
+                    chunk = symbols[i:i+10]
+                    args = [f"orderbook.1.{s[2]}" for s in chunk]
 
-            await ws.send(json.dumps({
-                "op": "subscribe",
-                "args": args
-            }))
+                    await ws.send(json.dumps({
+                        "op": "subscribe",
+                        "args": args
+                    }))
 
-        async for msg in ws:
-            data = json.loads(msg)
+                    await asyncio.sleep(0.1)  # 🔥 avoid burst spam
 
-            if "topic" not in data:
-                continue
+                async for msg in ws:
+                    data = json.loads(msg)
 
-            d = data.get("data")
-            if not d:
-                continue
+                    if "topic" not in data:
+                        continue
 
-            symbol = data["topic"].split(".")[-1]
-            bids = d.get("b")
-            asks = d.get("a")
+                    d = data.get("data")
+                    if not d:
+                        continue
 
-            if not bids or not asks:
-                continue
+                    symbol = data["topic"].split(".")[-1]
+                    bids = d.get("b")
+                    asks = d.get("a")
 
-            if len(bids) == 0 or len(asks) == 0:
-                continue
+                    if not bids or not asks:
+                        continue
 
-            bid = bids[0][0] if len(bids[0]) > 0 else None
-            ask = asks[0][0] if len(asks[0]) > 0 else None
+                    bid = bids[0][0]
+                    ask = asks[0][0]
 
-            if not bid or not ask:
-                continue
+                    update("bybit", symbol, bid, ask)
+                    await queue.put(True)
 
-            update("bybit", symbol, bid, ask)
-            await queue.put(True)
+        except Exception as e:
+            print(f"[BYBIT] reconnecting... {e}")
+            await asyncio.sleep(2)
 
 # =========================
 # SCANNER
