@@ -326,7 +326,6 @@ async def scanner():
                     continue
 
                 net_profit = result - 1 - SLIPPAGE_BUFFER
-                print(f"🔥 {ex.upper()} {tri} => {result:.6f} | NET {(net_profit * 100):.3f}%")
                 if net_profit > PROFIT_THRESHOLD:
                     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
