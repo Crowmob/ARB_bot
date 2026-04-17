@@ -1,10 +1,11 @@
 import asyncio
 import json
+import time
 from datetime import datetime
+from collections import defaultdict, deque
 
 import aiohttp
 import websockets
-from collections import defaultdict
 
 # =========================
 # CONFIG
@@ -20,15 +21,28 @@ FEE = {
     "bybit": 0.001
 }
 
-MIN_PROFIT = 1.01  # 0.1%
+PROFIT_THRESHOLD = 0.001  # 0.5%
+
+LATENCY = {
+    "binance": 0.15,
+    "bybit": 0.20
+}
 
 # =========================
-# STATE
+# STATE (ORDERBOOK DEPTH)
 # =========================
 
 orderbooks = {
-    "binance": {},
-    "bybit": {}
+    "binance": defaultdict(lambda: {
+        "bids": deque(maxlen=20),
+        "asks": deque(maxlen=20),
+        "ts": 0
+    }),
+    "bybit": defaultdict(lambda: {
+        "bids": deque(maxlen=20),
+        "asks": deque(maxlen=20),
+        "ts": 0
+    })
 }
 
 graph = {
@@ -36,27 +50,107 @@ graph = {
     "bybit": defaultdict(dict)
 }
 
-queue = asyncio.Queue()
-
 # =========================
-# REGISTER GRAPH (DIRECTED)
+# GRAPH REGISTER
 # =========================
 
 def register(exchange, base, quote, symbol):
-    # base -> quote
-    graph[exchange][base][quote] = symbol
-    # quote -> base
-    graph[exchange][quote][base] = symbol
+    graph[exchange][base][quote] = (symbol, base, quote)
+    graph[exchange][quote][base] = (symbol, base, quote)
 
 # =========================
-# UPDATE ORDERBOOK
+# ORDERBOOK UPDATE (DEPTH SIMULATION)
 # =========================
 
 def update(exchange, symbol, bid, ask):
-    orderbooks[exchange][symbol] = {
-        "bid": float(bid),
-        "ask": float(ask)
-    }
+    ob = orderbooks[exchange][symbol]
+
+    bid = float(bid)
+    ask = float(ask)
+
+    spread = max(ask - bid, bid * 0.0001)
+
+    # fake depth ladder (simple but effective)
+    for i in range(5):
+        ob["bids"].append((bid - i * spread * 0.2, 1.0))
+        ob["asks"].append((ask + i * spread * 0.2, 1.0))
+
+    ob["ts"] = time.time()
+
+# =========================
+# LATENCY CHECK
+# =========================
+
+def is_stale(exchange, symbol):
+    return time.time() - orderbooks[exchange][symbol]["ts"] > LATENCY[exchange]
+
+# =========================
+# DEPTH EXECUTION ENGINE
+# =========================
+
+def execute_sell(ob, amount):
+    total = 0
+    remaining = amount
+
+    for price, size in ob["bids"]:
+        take = min(size, remaining)
+        total += take * price
+        remaining -= take
+        if remaining <= 0:
+            break
+
+    if remaining > 0:
+        return None
+
+    return total
+
+
+def execute_buy(ob, amount):
+    cost = 0
+    remaining = amount
+
+    for price, size in ob["asks"]:
+        take = min(size, remaining)
+        cost += take * price
+        remaining -= take
+        if remaining <= 0:
+            break
+
+    if remaining > 0:
+        return None
+
+    return cost
+
+# =========================
+# CONVERSION ENGINE (UNCHANGED LOGIC FLOW)
+# =========================
+
+def convert(exchange, from_asset, to_asset, amount):
+    data = graph[exchange][from_asset].get(to_asset)
+    if not data:
+        return None
+
+    symbol, base, quote = data
+    ob = orderbooks[exchange].get(symbol)
+
+    if not ob or is_stale(exchange, symbol):
+        return None
+
+    # BUY base using quote
+    if from_asset == quote:
+        cost = execute_buy(ob, amount)
+        if cost is None:
+            return None
+        return (amount / (cost / amount)) * (1 - FEE[exchange])
+
+    # SELL base for quote
+    elif from_asset == base:
+        proceeds = execute_sell(ob, amount)
+        if proceeds is None:
+            return None
+        return proceeds * (1 - FEE[exchange])
+
+    return None
 
 # =========================
 # TRIANGLE FINDER
@@ -68,60 +162,33 @@ def find_triangles():
     for ex in ["binance", "bybit"]:
         g = graph[ex]
 
-        # ONLY start from USDT
         if "USDT" not in g:
             continue
 
-        for a in g["USDT"]:          # USDT → A
-            for b in g[a]:            # A → B
-                if "USDT" in g[b]:   # B → USDT
+        for a in g["USDT"]:
+            for b in g[a]:
+                if "USDT" in g[b]:
                     tris.append(("USDT", a, b, "USDT"))
 
     return tris
 
 # =========================
-# REAL CONVERSION ENGINE
-# =========================
-
-def convert(exchange, from_asset, to_asset, amount):
-    symbol = graph[exchange][from_asset].get(to_asset)
-    if not symbol:
-        return None
-
-    book = orderbooks[exchange].get(symbol)
-    if not book:
-        return None
-
-    # BUY
-    if from_asset == symbol[:len(from_asset)]:
-        price = book["ask"]
-        return (amount / price) * (1 - FEE[exchange])
-
-    # SELL
-    else:
-        price = book["bid"]
-        return amount * price * (1 - FEE[exchange])
-
-# =========================
-# SIMULATE TRIANGLE
+# SIMULATE
 # =========================
 
 def simulate(exchange, tri):
     usdt, a, b, _ = tri
 
-    v = 1.0  # start USDT
+    v = 1.0
 
-    # USDT → A
     v = convert(exchange, usdt, a, v)
     if v is None:
         return None
 
-    # A → B
     v = convert(exchange, a, b, v)
     if v is None:
         return None
 
-    # B → USDT
     v = convert(exchange, b, usdt, v)
     if v is None:
         return None
@@ -129,7 +196,7 @@ def simulate(exchange, tri):
     return v
 
 # =========================
-# BINANCE SYMBOLS
+# SYMBOL FETCHERS
 # =========================
 
 async def fetch_binance():
@@ -139,16 +206,12 @@ async def fetch_binance():
         async with s.get(url) as r:
             data = await r.json()
 
-    out = []
-    for x in data["symbols"]:
-        if x["status"] != "TRADING":
-            continue
-        out.append((x["baseAsset"], x["quoteAsset"], x["symbol"]))
-    return out
+    return [
+        (x["baseAsset"], x["quoteAsset"], x["symbol"])
+        for x in data["symbols"]
+        if x["status"] == "TRADING"
+    ]
 
-# =========================
-# BYBIT SYMBOLS
-# =========================
 
 async def fetch_bybit():
     url = "https://api.bybit.com/v5/market/instruments-info?category=spot"
@@ -157,15 +220,14 @@ async def fetch_bybit():
         async with s.get(url) as r:
             data = await r.json()
 
-    out = []
-    for x in data["result"]["list"]:
-        if x["status"] != "Trading":
-            continue
-        out.append((x["baseCoin"], x["quoteCoin"], x["symbol"]))
-    return out
+    return [
+        (x["baseCoin"], x["quoteCoin"], x["symbol"])
+        for x in data["result"]["list"]
+        if x["status"] == "Trading"
+    ]
 
 # =========================
-# BINANCE WS (SAFE CHUNKED)
+# BINANCE WS
 # =========================
 
 async def binance_ws(symbols):
@@ -177,11 +239,7 @@ async def binance_ws(symbols):
                 streams = "/".join([s[2].lower() + "@bookTicker" for s in chunk])
                 url = f"{BINANCE_WS}?streams={streams}"
 
-                async with websockets.connect(
-                    url,
-                    ping_interval=20,
-                    ping_timeout=20
-                ) as ws:
+                async with websockets.connect(url, ping_interval=20) as ws:
                     print(f"[BINANCE] connected {len(chunk)}")
 
                     async for msg in ws:
@@ -192,38 +250,27 @@ async def binance_ws(symbols):
                         update("binance", data["s"], data["b"], data["a"])
 
             except Exception as e:
-                print(f"[BINANCE] reconnecting... {e}")
+                print("[BINANCE] reconnect", e)
                 await asyncio.sleep(2)
 
-    await asyncio.gather(*[
-        run(symbols[i:i+chunk_size])
-        for i in range(0, len(symbols), chunk_size)
-    ])
+    await asyncio.gather(*[run(symbols[i:i+chunk_size]) for i in range(0, len(symbols), chunk_size)])
 
 # =========================
-# BYBIT WS (10 PER SUB)
+# BYBIT WS
 # =========================
 
 async def bybit_ws(symbols):
     while True:
         try:
-            async with websockets.connect(
-                BYBIT_WS,
-                ping_interval=20,
-                ping_timeout=20
-            ) as ws:
+            async with websockets.connect(BYBIT_WS, ping_interval=20) as ws:
                 print("[BYBIT] connected")
 
                 for i in range(0, len(symbols), 10):
                     chunk = symbols[i:i+10]
                     args = [f"orderbook.1.{s[2]}" for s in chunk]
 
-                    await ws.send(json.dumps({
-                        "op": "subscribe",
-                        "args": args
-                    }))
-
-                    await asyncio.sleep(0.1)  # 🔥 avoid burst spam
+                    await ws.send(json.dumps({"op": "subscribe", "args": args}))
+                    await asyncio.sleep(0.1)
 
                 async for msg in ws:
                     data = json.loads(msg)
@@ -242,14 +289,10 @@ async def bybit_ws(symbols):
                     if not bids or not asks:
                         continue
 
-                    bid = bids[0][0]
-                    ask = asks[0][0]
-
-                    update("bybit", symbol, bid, ask)
-                    await queue.put(True)
+                    update("bybit", symbol, bids[0][0], asks[0][0])
 
         except Exception as e:
-            print(f"[BYBIT] reconnecting... {e}")
+            print("[BYBIT] reconnect", e)
             await asyncio.sleep(2)
 
 # =========================
@@ -271,14 +314,15 @@ async def scanner():
                 if not result:
                     continue
 
-                profit = (result - 1) * 100
+                profit = result - 1
 
-                if result > MIN_PROFIT:
+                if profit > PROFIT_THRESHOLD:
                     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                    log_file.write(f"{now} 🔥 {ex.upper()} {tri} => {result:.6f} | {profit:.3f}%\n")
+                    log_file.write(f"{now} 🔥 {ex.upper()} {tri} => {result:.6f} | {profit*100:.3f}%\n")
                     log_file.flush()
-                    print(f"🔥 {ex.upper()} {tri} => {result:.6f} | {profit:.3f}%")
+
+                    print(f"🔥 {ex.upper()} {tri} => {result:.6f} | {profit*100:.3f}%")
 
 # =========================
 # MAIN
