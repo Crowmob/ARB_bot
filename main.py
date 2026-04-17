@@ -21,7 +21,10 @@ FEE = {
     "bybit": 0.001
 }
 
-PROFIT_THRESHOLD = 0.001  # 0.5%
+FEE_TOTAL = 0.003
+SLIPPAGE_BUFFER = 0.001
+
+PROFIT_THRESHOLD = 0.0015  # 0.15%
 
 LATENCY = {
     "binance": 0.15,
@@ -136,19 +139,27 @@ def convert(exchange, from_asset, to_asset, amount):
     if not ob or is_stale(exchange, symbol):
         return None
 
-    # BUY base using quote
+    fee = FEE[exchange]
+
+    # CASE 1: from_asset is quote → BUY base (use asks)
     if from_asset == quote:
         cost = execute_buy(ob, amount)
         if cost is None:
             return None
-        return (amount / (cost / amount)) * (1 - FEE[exchange])
 
-    # SELL base for quote
+        # how much base we actually get
+        base_amount = amount / (cost / amount)
+
+        # apply fee on received asset
+        return base_amount * (1 - fee)
+
+    # CASE 2: from_asset is base → SELL base (use bids)
     elif from_asset == base:
         proceeds = execute_sell(ob, amount)
         if proceeds is None:
             return None
-        return proceeds * (1 - FEE[exchange])
+
+        return proceeds * (1 - fee)
 
     return None
 
@@ -314,15 +325,15 @@ async def scanner():
                 if not result:
                     continue
 
-                profit = result - 1
-
-                if profit > PROFIT_THRESHOLD:
+                net_profit = result - 1 - SLIPPAGE_BUFFER
+                print(f"🔥 {ex.upper()} {tri} => {result:.6f} | NET {(net_profit * 100):.3f}%")
+                if net_profit > PROFIT_THRESHOLD:
                     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                    log_file.write(f"{now} 🔥 {ex.upper()} {tri} => {result:.6f} | {profit*100:.3f}%\n")
+                    log_file.write(f"🔥 {now}: {ex.upper()} {tri} => {result:.6f} | NET {(net_profit*100):.3f}%")
                     log_file.flush()
 
-                    print(f"🔥 {ex.upper()} {tri} => {result:.6f} | {profit*100:.3f}%")
+                    print(f"🔥 {ex.upper()} {tri} => {result:.6f} | NET {(net_profit*100):.3f}%")
 
 # =========================
 # MAIN
