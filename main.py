@@ -96,13 +96,17 @@ def execute_sell(ob, amount):
     remaining = amount
 
     for price, size in ob["bids"]:
+        if price <= 0 or size <= 0:
+            continue
+
         take = min(size, remaining)
         total += take * price
         remaining -= take
+
         if remaining <= 0:
             break
 
-    if remaining > 0:
+    if remaining > 0 or total <= 0:
         return None
 
     return total
@@ -113,13 +117,17 @@ def execute_buy(ob, amount):
     remaining = amount
 
     for price, size in ob["asks"]:
+        if price <= 0 or size <= 0:
+            continue
+
         take = min(size, remaining)
         cost += take * price
         remaining -= take
+
         if remaining <= 0:
             break
 
-    if remaining > 0:
+    if remaining > 0 or cost <= 0:
         return None
 
     return cost
@@ -129,6 +137,9 @@ def execute_buy(ob, amount):
 # =========================
 
 def convert(exchange, from_asset, to_asset, amount):
+    if amount is None or amount <= 0:
+        return None
+
     data = graph[exchange][from_asset].get(to_asset)
     if not data:
         return None
@@ -144,13 +155,17 @@ def convert(exchange, from_asset, to_asset, amount):
     # CASE 1: from_asset is quote → BUY base (use asks)
     if from_asset == quote:
         cost = execute_buy(ob, amount)
-        if cost is None:
+
+        if cost is None or cost <= 0:
             return None
 
-        # how much base we actually get
-        base_amount = amount / (cost / amount)
+        avg_price = cost / amount
 
-        # apply fee on received asset
+        if avg_price <= 0:
+            return None
+
+        base_amount = amount / avg_price
+
         return base_amount * (1 - fee)
 
     # CASE 2: from_asset is base → SELL base (use bids)
@@ -329,7 +344,7 @@ async def scanner():
                 if net_profit > PROFIT_THRESHOLD:
                     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                    log_file.write(f"🔥 {now}: {ex.upper()} {tri} => {result:.6f} | NET {(net_profit*100):.3f}%")
+                    log_file.write(f"🔥 {now}: {ex.upper()} {tri} => {result:.6f} | NET {(net_profit*100):.3f}%\n")
                     log_file.flush()
 
                     print(f"🔥 {ex.upper()} {tri} => {result:.6f} | NET {(net_profit*100):.3f}%")
