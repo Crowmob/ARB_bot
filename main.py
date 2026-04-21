@@ -338,6 +338,14 @@ async def bybit_ws(symbols):
 # SCANNER
 # =========================
 
+
+def safe_float(x):
+    try:
+        return float(x)
+    except:
+        return 0.0
+
+
 async def execute_triangle_bybit(tri):
     try:
         balance_data = session.get_wallet_balance(accountType="UNIFIED")
@@ -346,7 +354,7 @@ async def execute_triangle_bybit(tri):
         usdt_balance = 0
         for c in coins:
             if c["coin"] == "USDT":
-                usdt_balance = float(c.get("availableToWithdraw", 0))
+                usdt_balance = safe_float(c.get("availableToWithdraw", 0))
                 break
 
         if usdt_balance <= 0:
@@ -416,7 +424,7 @@ async def execute_triangle_bybit(tri):
             amount = 0
             for c in coins:
                 if c["coin"] == to_asset:
-                    amount = float(c["walletBalance"])
+                    amount = safe_float(c["walletBalance"])
                     break
 
             if amount <= 0:
