@@ -6,7 +6,10 @@ from collections import defaultdict, deque
 from pybit.unified_trading import HTTP
 import aiohttp
 import websockets
-from unicodedata import category
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
 
 # =========================
 # CONFIG
@@ -14,8 +17,8 @@ from unicodedata import category
 
 session = HTTP(
     testnet=False,
-    api_key="lZs6dpNHLo66RQk042",
-    api_secret="t76ywUUzQ3y6Nzkrc1mDkxbvou6DUSQpqOEm",
+    api_key=os.getenv("BYBIT_API_KEY"),
+    api_secret=os.getenv("BYBIT_API_SECRET"),
     recv_window=15000,
 )
 initial = session.get_wallet_balance(accountType="UNIFIED")["result"]["list"][0]["totalEquity"]
