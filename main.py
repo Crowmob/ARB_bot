@@ -3,13 +3,23 @@ import json
 import time
 from datetime import datetime
 from collections import defaultdict, deque
-
+from pybit.unified_trading import HTTP
 import aiohttp
 import websockets
+from unicodedata import category
 
 # =========================
 # CONFIG
 # =========================
+
+session = HTTP(
+    testnet=False,
+    api_key="lZs6dpNHLo66RQk042",
+    api_secret="t76ywUUzQ3y6Nzkrc1mDkxbvou6DUSQpqOEm",
+    recv_window=15000,
+)
+initial = session.get_wallet_balance(accountType="UNIFIED")["result"]["list"][0]["totalEquity"]
+print(initial)
 
 log_file = open("logs.txt", "a", encoding="utf-8")
 
@@ -24,7 +34,7 @@ FEE = {
 FEE_TOTAL = 0.003
 SLIPPAGE_BUFFER = 0.001
 
-PROFIT_THRESHOLD = 0.0015  # 0.15%
+PROFIT_THRESHOLD = 0.005  # 0.5%
 
 LATENCY = {
     "binance": 0.15,
@@ -325,6 +335,95 @@ async def bybit_ws(symbols):
 # SCANNER
 # =========================
 
+async def execute_triangle_bybit(tri):
+    try:
+        balance_data = session.get_wallet_balance(accountType="UNIFIED")
+        coins = balance_data["result"]["list"][0]["coin"]
+
+        usdt_balance = 0
+        for c in coins:
+            if c["coin"] == "USDT":
+                usdt_balance = float(c.get("availableToWithdraw", 0))
+                break
+
+        if usdt_balance <= 0:
+            print("No USDT balance")
+            return
+
+        start_amount = 5.0
+
+        if usdt_balance < start_amount:
+            print("Not enough USDT balance")
+            return
+
+        amount = start_amount
+
+        print(f"🚀 EXECUTING TRIANGLE with {amount:.2f} USDT")
+
+        path = [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[3])]
+
+        for from_asset, to_asset in path:
+            data = graph["bybit"][from_asset].get(to_asset)
+            if not data:
+                print("Pair not found")
+                return
+
+            symbol, base, quote = data
+
+            # BUY
+            if from_asset == quote:
+                side = "Buy"
+
+                # approximate qty using ask
+                ob = orderbooks["bybit"][symbol]
+                if not ob["asks"]:
+                    return
+
+                price = ob["asks"][0][0]
+                qty = amount / price
+
+            # SELL
+            else:
+                side = "Sell"
+                qty = amount
+
+            # round qty (simple, you can improve later)
+            qty = round(qty, 6)
+
+            print(f"{side} {symbol} qty={qty}")
+
+            order = session.place_order(
+                category="spot",
+                symbol=symbol,
+                side=side,
+                orderType="Market",
+                qty=str(qty),
+            )
+
+            print("ORDER:", order)
+
+            # small delay to let balance update
+            await asyncio.sleep(0.3)
+
+            # update amount after trade (VERY IMPORTANT)
+            # fetch new balance of resulting asset
+            balance_data = session.get_wallet_balance(accountType="UNIFIED")
+            coins = balance_data["result"]["list"][0]["coin"]
+
+            amount = 0
+            for c in coins:
+                if c["coin"] == to_asset:
+                    amount = float(c["walletBalance"])
+                    break
+
+            if amount <= 0:
+                print("Execution failed mid-path")
+                return
+
+    except Exception as e:
+        print("EXECUTION ERROR:", e)
+
+
 async def scanner():
     await asyncio.sleep(5)
 
@@ -341,13 +440,20 @@ async def scanner():
                     continue
 
                 net_profit = result - 1 - SLIPPAGE_BUFFER
+
                 if net_profit > PROFIT_THRESHOLD:
                     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                    print(f"🔥 {ex.upper()} {tri} => {result:.6f} | NET {(net_profit*100):.3f}%")
 
                     log_file.write(f"🔥 {now}: {ex.upper()} {tri} => {result:.6f} | NET {(net_profit*100):.3f}%\n")
                     log_file.flush()
 
-                    print(f"🔥 {ex.upper()} {tri} => {result:.6f} | NET {(net_profit*100):.3f}%")
+                    # ✅ EXECUTE ONLY BYBIT
+                    if ex == "bybit":
+                        await execute_triangle_bybit(tri)
+                        print(initial, session.get_wallet_balance(accountType="UNIFIED")["result"]["list"][0]["totalEquity"])
+                        quit()
 
 # =========================
 # MAIN
