@@ -17,8 +17,8 @@ load_dotenv()
 
 session = HTTP(
     testnet=False,
-    api_key=os.getenv("BYBIT_API_KEY"),
-    api_secret=os.getenv("BYBIT_API_SECRET"),
+    api_key=os.getenv("API_KEY"),
+    api_secret=os.getenv("API_SECRET"),
     recv_window=15000,
 )
 initial = session.get_wallet_balance(accountType="UNIFIED")["result"]["list"][0]["totalEquity"]
