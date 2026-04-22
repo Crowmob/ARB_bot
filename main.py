@@ -402,14 +402,18 @@ async def execute_triangle_bybit(tri):
             qty = round(qty, 6)
 
             print(f"{side} {symbol} qty={qty}")
-
-            order = session.place_order(
-                category="spot",
-                symbol=symbol,
-                side=side,
-                orderType="Market",
-                qty=str(qty),
-            )
+            order = None
+            try:
+                order = session.place_order(
+                    category="spot",
+                    symbol=symbol,
+                    side=side,
+                    orderType="Market",
+                    qty=str(qty),
+                )
+            except Exception as e:
+                if "not supported" in str(e):
+                    return
 
             print("ORDER:", order)
 
