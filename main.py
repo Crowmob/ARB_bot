@@ -412,8 +412,20 @@ async def execute_triangle_bybit(tri):
                     qty=str(qty),
                 )
             except Exception as e:
+                print("❌ ORDER EXCEPTION:", e)
+
                 if "not supported" in str(e):
                     return "not supported"
+
+                return  # stop execution on ANY error
+
+            if not order:
+                print("❌ ORDER RETURNED NONE")
+                return
+
+            if order.get("retCode") != 0:
+                print("❌ ORDER FAILED:", order)
+                return
 
             print("ORDER:", order)
 
