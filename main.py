@@ -354,7 +354,7 @@ async def execute_triangle_bybit(tri):
         usdt_balance = 0
         for c in coins:
             if c["coin"] == "USDT":
-                usdt_balance = safe_float(c.get("availableToWithdraw", 0))
+                usdt_balance = safe_float(c["equity"])
                 break
 
         if usdt_balance <= 0:
