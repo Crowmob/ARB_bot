@@ -21,16 +21,15 @@ session = HTTP(
     api_secret=os.getenv("API_SECRET"),
     recv_window=15000,
 )
+
 initial = session.get_wallet_balance(accountType="UNIFIED")["result"]["list"][0]["totalEquity"]
 print(initial)
 
 log_file = open("logs.txt", "a", encoding="utf-8")
 
-BINANCE_WS = "wss://stream.binance.com:9443/stream"
 BYBIT_WS = "wss://stream.bybit.com/v5/public/spot"
 
 FEE = {
-    "binance": 0.001,
     "bybit": 0.001
 }
 
@@ -40,7 +39,6 @@ SLIPPAGE_BUFFER = 0.001
 PROFIT_THRESHOLD = 0.005  # 0.5%
 
 LATENCY = {
-    "binance": 0.15,
     "bybit": 0.20
 }
 
@@ -49,11 +47,6 @@ LATENCY = {
 # =========================
 
 orderbooks = {
-    "binance": defaultdict(lambda: {
-        "bids": deque(maxlen=20),
-        "asks": deque(maxlen=20),
-        "ts": 0
-    }),
     "bybit": defaultdict(lambda: {
         "bids": deque(maxlen=20),
         "asks": deque(maxlen=20),
@@ -62,7 +55,6 @@ orderbooks = {
 }
 
 graph = {
-    "binance": defaultdict(dict),
     "bybit": defaultdict(dict)
 }
 
@@ -75,7 +67,7 @@ def register(exchange, base, quote, symbol):
     graph[exchange][quote][base] = (symbol, base, quote)
 
 # =========================
-# ORDERBOOK UPDATE (DEPTH SIMULATION)
+# ORDERBOOK UPDATE
 # =========================
 
 def update(exchange, symbol, bid, ask):
@@ -86,7 +78,6 @@ def update(exchange, symbol, bid, ask):
 
     spread = max(ask - bid, bid * 0.0001)
 
-    # fake depth ladder (simple but effective)
     for i in range(5):
         ob["bids"].append((bid - i * spread * 0.2, 1.0))
         ob["asks"].append((ask + i * spread * 0.2, 1.0))
@@ -146,7 +137,7 @@ def execute_buy(ob, amount):
     return cost
 
 # =========================
-# CONVERSION ENGINE (UNCHANGED LOGIC FLOW)
+# CONVERSION ENGINE
 # =========================
 
 def convert(exchange, from_asset, to_asset, amount):
@@ -165,7 +156,6 @@ def convert(exchange, from_asset, to_asset, amount):
 
     fee = FEE[exchange]
 
-    # CASE 1: from_asset is quote → BUY base (use asks)
     if from_asset == quote:
         cost = execute_buy(ob, amount)
 
@@ -181,7 +171,6 @@ def convert(exchange, from_asset, to_asset, amount):
 
         return base_amount * (1 - fee)
 
-    # CASE 2: from_asset is base → SELL base (use bids)
     elif from_asset == base:
         proceeds = execute_sell(ob, amount)
         if proceeds is None:
@@ -198,16 +187,15 @@ def convert(exchange, from_asset, to_asset, amount):
 def find_triangles():
     tris = []
 
-    for ex in ["binance", "bybit"]:
-        g = graph[ex]
+    g = graph["bybit"]
 
-        if "USDT" not in g:
-            continue
+    if "USDT" not in g:
+        return tris
 
-        for a in g["USDT"]:
-            for b in g[a]:
-                if "USDT" in g[b]:
-                    tris.append(("USDT", a, b, "USDT"))
+    for a in g["USDT"]:
+        for b in g[a]:
+            if "USDT" in g[b]:
+                tris.append(("USDT", a, b, "USDT"))
 
     return tris
 
@@ -235,22 +223,8 @@ def simulate(exchange, tri):
     return v
 
 # =========================
-# SYMBOL FETCHERS
+# BYBIT SYMBOL FETCH
 # =========================
-
-async def fetch_binance():
-    url = "https://api.binance.com/api/v3/exchangeInfo"
-
-    async with aiohttp.ClientSession() as s:
-        async with s.get(url) as r:
-            data = await r.json()
-
-    return [
-        (x["baseAsset"], x["quoteAsset"], x["symbol"])
-        for x in data["symbols"]
-        if x["status"] == "TRADING"
-    ]
-
 
 async def fetch_bybit():
     url = "https://api.bybit.com/v5/market/instruments-info?category=spot"
@@ -264,35 +238,6 @@ async def fetch_bybit():
         for x in data["result"]["list"]
         if x["status"] == "Trading"
     ]
-
-# =========================
-# BINANCE WS
-# =========================
-
-async def binance_ws(symbols):
-    chunk_size = 50
-
-    async def run(chunk):
-        while True:
-            try:
-                streams = "/".join([s[2].lower() + "@bookTicker" for s in chunk])
-                url = f"{BINANCE_WS}?streams={streams}"
-
-                async with websockets.connect(url, ping_interval=20) as ws:
-                    print(f"[BINANCE] connected {len(chunk)}")
-
-                    async for msg in ws:
-                        data = json.loads(msg).get("data")
-                        if not data:
-                            continue
-
-                        update("binance", data["s"], data["b"], data["a"])
-
-            except Exception as e:
-                print("[BINANCE] reconnect", e)
-                await asyncio.sleep(2)
-
-    await asyncio.gather(*[run(symbols[i:i+chunk_size]) for i in range(0, len(symbols), chunk_size)])
 
 # =========================
 # BYBIT WS
@@ -338,13 +283,11 @@ async def bybit_ws(symbols):
 # SCANNER
 # =========================
 
-
 def safe_float(x):
     try:
         return float(x)
     except:
         return 0.0
-
 
 async def execute_triangle_bybit(tri):
     try:
@@ -381,24 +324,19 @@ async def execute_triangle_bybit(tri):
 
             symbol, base, quote = data
 
-            # BUY
             if from_asset == quote:
                 side = "Buy"
 
-                # approximate qty using ask
                 ob = orderbooks["bybit"][symbol]
                 if not ob["asks"]:
                     return
 
                 price = ob["asks"][0][0]
                 qty = amount / price
-
-            # SELL
             else:
                 side = "Sell"
                 qty = amount
 
-            # round qty (simple, you can improve later)
             qty = round(qty, 6)
 
             print(f"{side} {symbol} qty={qty}")
@@ -417,7 +355,7 @@ async def execute_triangle_bybit(tri):
                 if "not supported" in str(e):
                     return "not supported"
 
-                return  # stop execution on ANY error
+                return
 
             if not order:
                 print("❌ ORDER RETURNED NONE")
@@ -429,11 +367,8 @@ async def execute_triangle_bybit(tri):
 
             print("ORDER:", order)
 
-            # small delay to let balance update
             await asyncio.sleep(0.3)
 
-            # update amount after trade (VERY IMPORTANT)
-            # fetch new balance of resulting asset
             balance_data = session.get_wallet_balance(accountType="UNIFIED")
             coins = balance_data["result"]["list"][0]["coin"]
 
@@ -450,7 +385,6 @@ async def execute_triangle_bybit(tri):
     except Exception as e:
         print("EXECUTION ERROR:", e)
 
-
 async def scanner():
     await asyncio.sleep(5)
 
@@ -459,49 +393,43 @@ async def scanner():
 
         tris = find_triangles()
 
-        for ex in ["binance", "bybit"]:
-            for tri in tris:
-                result = simulate(ex, tri)
+        for tri in tris:
+            result = simulate("bybit", tri)
 
-                if not result:
-                    continue
+            if not result:
+                continue
 
-                net_profit = result - 1 - SLIPPAGE_BUFFER
+            net_profit = result - 1 - SLIPPAGE_BUFFER
 
-                if net_profit > PROFIT_THRESHOLD:
-                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if net_profit > PROFIT_THRESHOLD:
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                    print(f"🔥 {ex.upper()} {tri} => {result:.6f} | NET {(net_profit*100):.3f}%")
+                print(f"🔥 BYBIT {tri} => {result:.6f} | NET {(net_profit*100):.3f}%")
 
-                    log_file.write(f"🔥 {now}: {ex.upper()} {tri} => {result:.6f} | NET {(net_profit*100):.3f}%\n")
-                    log_file.flush()
+                log_file.write(f"🔥 {now}: BYBIT {tri} => {result:.6f} | NET {(net_profit*100):.3f}%\n")
+                log_file.flush()
 
-                    # ✅ EXECUTE ONLY BYBIT
-                    if ex == "bybit":
-                        res = await execute_triangle_bybit(tri)
-                        print(initial, session.get_wallet_balance(accountType="UNIFIED")["result"]["list"][0]["totalEquity"])
-                        if res != "not supported": quit()
-                        else: print(res)
+                res = await execute_triangle_bybit(tri)
+                print(initial, session.get_wallet_balance(accountType="UNIFIED")["result"]["list"][0]["totalEquity"])
+
+                if res != "not supported":
+                    quit()
+                else:
+                    print(res)
 
 # =========================
 # MAIN
 # =========================
 
 async def main():
-    binance = await fetch_binance()
     bybit = await fetch_bybit()
-
-    for b, q, s in binance:
-        register("binance", b, q, s)
 
     for b, q, s in bybit:
         register("bybit", b, q, s)
 
-    print("Binance:", len(binance))
     print("Bybit:", len(bybit))
 
     await asyncio.gather(
-        binance_ws(binance),
         bybit_ws(bybit),
         scanner()
     )
