@@ -413,7 +413,7 @@ async def execute_triangle_bybit(tri):
                 )
             except Exception as e:
                 if "not supported" in str(e):
-                    return
+                    return "not supported"
 
             print("ORDER:", order)
 
@@ -466,9 +466,10 @@ async def scanner():
 
                     # ✅ EXECUTE ONLY BYBIT
                     if ex == "bybit":
-                        await execute_triangle_bybit(tri)
+                        res = await execute_triangle_bybit(tri)
                         print(initial, session.get_wallet_balance(accountType="UNIFIED")["result"]["list"][0]["totalEquity"])
-                        quit()
+                        if res != "not supported": quit()
+                        else: print(res)
 
 # =========================
 # MAIN
