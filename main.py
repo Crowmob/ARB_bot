@@ -305,6 +305,7 @@ async def execute_triangle_bybit(tri):
             return
 
         start_amount = 5.0
+        print(usdt_balance)
 
         if usdt_balance < start_amount:
             print("Not enough USDT balance")
