@@ -246,7 +246,7 @@ async def fetch_bybit():
 async def bybit_ws(symbols):
     while True:
         try:
-            async with websockets.connect(BYBIT_WS, ping_interval=20) as ws:
+            async with websockets.connect(BYBIT_WS, ping_interval=20, ping_timeout=20) as ws:
                 print("[BYBIT] connected")
 
                 for i in range(0, len(symbols), 10):
@@ -275,9 +275,13 @@ async def bybit_ws(symbols):
 
                     update("bybit", symbol, bids[0][0], asks[0][0])
 
+                    await asyncio.sleep(0)
+
         except Exception as e:
             print("[BYBIT] reconnect", e)
             await asyncio.sleep(2)
+
+
 
 # =========================
 # SCANNER
@@ -401,7 +405,6 @@ async def scanner():
                 continue
 
             net_profit = result - 1 - SLIPPAGE_BUFFER
-
             if net_profit > PROFIT_THRESHOLD:
                 now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -430,8 +433,13 @@ async def main():
 
     print("Bybit:", len(bybit))
 
+    CHUNK_SIZE = 60
+    chunks = [bybit[i:i+CHUNK_SIZE] for i in range(0, len(bybit), CHUNK_SIZE)]
+
+    print(f"Starting {len(chunks)} WS connections...")
+
     await asyncio.gather(
-        bybit_ws(bybit),
+        *[bybit_ws(chunk) for chunk in chunks],
         scanner()
     )
 
