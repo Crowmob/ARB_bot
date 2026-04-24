@@ -247,8 +247,6 @@ async def bybit_ws(symbols):
     while True:
         try:
             async with websockets.connect(BYBIT_WS, ping_interval=20, ping_timeout=20) as ws:
-                print("[BYBIT] connected")
-
                 for i in range(0, len(symbols), 10):
                     chunk = symbols[i:i+10]
                     args = [f"orderbook.1.{s[2]}" for s in chunk]
@@ -278,7 +276,6 @@ async def bybit_ws(symbols):
                     await asyncio.sleep(0)
 
         except Exception as e:
-            print("[BYBIT] reconnect", e)
             await asyncio.sleep(2)
 
 
