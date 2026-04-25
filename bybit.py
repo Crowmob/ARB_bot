@@ -25,7 +25,7 @@ session = HTTP(
 initial = session.get_wallet_balance(accountType="UNIFIED")["result"]["list"][0]["totalEquity"]
 print(initial)
 
-log_file = open("logs.txt", "a", encoding="utf-8")
+log_file = open("logs_bybit.txt", "a", encoding="utf-8")
 
 BYBIT_WS = "wss://stream.bybit.com/v5/public/spot"
 
