@@ -275,7 +275,7 @@ async def bybit_ws(symbols):
 
                     await asyncio.sleep(0)
 
-        except Exception as e:
+        except:
             await asyncio.sleep(2)
 
 
@@ -295,54 +295,69 @@ async def execute_triangle_bybit(tri):
         balance_data = session.get_wallet_balance(accountType="UNIFIED")
         coins = balance_data["result"]["list"][0]["coin"]
 
-        usdt_balance = 0
-        for c in coins:
-            if c["coin"] == "USDT":
-                usdt_balance = safe_float(c["equity"])
-                break
+        def get_balance(asset):
+            for c in coins:
+                if c["coin"] == asset:
+                    # safer than walletBalance
+                    return safe_float(c.get("availableToWithdraw", c.get("walletBalance", 0)))
+            return 0.0
+
+        usdt_balance = get_balance("USDT")
 
         if usdt_balance <= 0:
             print("No USDT balance")
             return
 
-        start_amount = 5.0
-        print(usdt_balance)
-
-        if usdt_balance < start_amount:
-            print("Not enough USDT balance")
+        start_amount = min(5.0, usdt_balance * 0.95)  # don't use full balance
+        if start_amount < 1:
+            print("Balance too small")
             return
 
         amount = start_amount
-
-        print(f"🚀 EXECUTING TRIANGLE with {amount:.2f} USDT")
+        print(f"🚀 EXECUTING TRIANGLE with {amount:.4f} USDT")
 
         path = [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[3])]
 
-        for from_asset, to_asset in path:
+        for step, (from_asset, to_asset) in enumerate(path):
             data = graph["bybit"][from_asset].get(to_asset)
             if not data:
                 print("Pair not found")
                 return
 
             symbol, base, quote = data
+            ob = orderbooks["bybit"][symbol]
+
+            if not ob["bids"] or not ob["asks"]:
+                print("No orderbook")
+                return
+
+            # ===== SAFETY BUFFER =====
+            amount *= 0.995  # fees + slippage protection
 
             if from_asset == quote:
+                # BUY
                 side = "Buy"
+                price = ob["asks"][0][0]
 
-                ob = orderbooks["bybit"][symbol]
-                if not ob["asks"]:
+                if price <= 0:
                     return
 
-                price = ob["asks"][0][0]
                 qty = amount / price
+
             else:
+                # SELL
                 side = "Sell"
                 qty = amount
 
-            qty = round(qty, 6)
+            # ===== ROUND DOWN (CRITICAL) =====
+            qty = safe_float(f"{qty:.6f}")  # truncate, not round up
+
+            if qty <= 0:
+                print("Qty too small")
+                return
 
             print(f"{side} {symbol} qty={qty}")
-            order = None
+
             try:
                 order = session.place_order(
                     category="spot",
@@ -353,36 +368,32 @@ async def execute_triangle_bybit(tri):
                 )
             except Exception as e:
                 print("❌ ORDER EXCEPTION:", e)
-
-                if "not supported" in str(e):
-                    return "not supported"
-
                 return
 
-            if not order:
-                print("❌ ORDER RETURNED NONE")
-                return
-
-            if order.get("retCode") != 0:
+            if not order or order.get("retCode") != 0:
                 print("❌ ORDER FAILED:", order)
                 return
 
             print("ORDER:", order)
 
-            await asyncio.sleep(0.3)
+            # ===== WAIT FOR BALANCE UPDATE =====
+            await asyncio.sleep(0.5)
 
+            # refresh balances
             balance_data = session.get_wallet_balance(accountType="UNIFIED")
             coins = balance_data["result"]["list"][0]["coin"]
 
-            amount = 0
-            for c in coins:
-                if c["coin"] == to_asset:
-                    amount = safe_float(c["walletBalance"])
-                    break
+            new_amount = get_balance(to_asset)
 
-            if amount <= 0:
+            print(f"➡️ Received {new_amount:.6f} {to_asset}")
+
+            if new_amount <= 0:
                 print("Execution failed mid-path")
                 return
+
+            amount = new_amount
+
+        print("✅ TRIANGLE COMPLETED")
 
     except Exception as e:
         print("EXECUTION ERROR:", e)
