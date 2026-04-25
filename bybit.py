@@ -290,19 +290,23 @@ def safe_float(x):
     except:
         return 0.0
 
+
 async def execute_triangle_bybit(tri):
     try:
         balance_data = session.get_wallet_balance(accountType="UNIFIED")
         coins = balance_data["result"]["list"][0]["coin"]
 
-        def get_balance(asset):
+        def get_balance(coins, asset):
             for c in coins:
                 if c["coin"] == asset:
-                    # safer than walletBalance
-                    return safe_float(c.get("availableToWithdraw", c.get("walletBalance", 0)))
+                    return float(
+                        c.get("availableToTrade") or
+                        c.get("walletBalance") or
+                        c.get("equity") or 0
+                    )
             return 0.0
 
-        usdt_balance = get_balance("USDT")
+        usdt_balance = get_balance(coins, "USDT")
 
         if usdt_balance <= 0:
             print("No USDT balance")
